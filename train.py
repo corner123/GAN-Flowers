@@ -10,6 +10,12 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 from tqdm import tqdm
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (DATA_DIR, GLOVE_PATH, IMAGE_SIZE, LATENT_DIM, TEXT_EMBED_DIM,
                     CONDITION_DIM, BASE_CHANNELS, BATCH_SIZE, EPOCHS,
@@ -18,9 +24,10 @@ from config import (DATA_DIR, GLOVE_PATH, IMAGE_SIZE, LATENT_DIM, TEXT_EMBED_DIM
                     KL_ANNEAL_EPOCHS, USE_AMP, LOG_INTERVAL,
                     SAVE_INTERVAL, SAMPLE_INTERVAL, N_SAMPLES,
                     DEVICE, OUTPUT_DIR, CHECKPOINT_DIR)
-from dataset import FlowersDataset
+from dataset import FlowersDataset, load_glove_for_inference
 from model import (VaeGan, Discriminator, PerceptualLoss,
-                   vae_loss, d_loss_fn, g_loss_fn, gradient_penalty)
+                   vae_loss, d_loss_fn, g_loss_fn, gradient_penalty,
+                   weights_init)
 
 
 def save_sample_images(vae_gan, dataset, epoch, device, n=N_SAMPLES):
@@ -79,13 +86,15 @@ def train(args):
     print()
 
     # --- Data ---
+    glove = load_glove_for_inference(GLOVE_PATH, TEXT_EMBED_DIM)
+
     train_dataset = FlowersDataset(
         DATA_DIR, GLOVE_PATH, split="train",
-        image_size=IMAGE_SIZE, glove_dim=TEXT_EMBED_DIM, augment=True)
+        image_size=IMAGE_SIZE, glove_dim=TEXT_EMBED_DIM, augment=True, glove=glove)
 
     val_dataset = FlowersDataset(
         DATA_DIR, GLOVE_PATH, split="val",
-        image_size=IMAGE_SIZE, glove_dim=TEXT_EMBED_DIM, augment=False)
+        image_size=IMAGE_SIZE, glove_dim=TEXT_EMBED_DIM, augment=False, glove=glove)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=4, pin_memory=True, drop_last=True)
@@ -101,6 +110,9 @@ def train(args):
                      condition_dim=CONDITION_DIM, base_ch=BASE_CHANNELS).to(DEVICE)
     discriminator = Discriminator(base_ch=BASE_CHANNELS, condition_dim=CONDITION_DIM).to(DEVICE)
     perceptual = PerceptualLoss().to(DEVICE)
+
+    vae_gan.apply(weights_init)
+    discriminator.apply(weights_init)
 
     n_g_params = sum(p.numel() for p in vae_gan.parameters())
     n_d_params = sum(p.numel() for p in discriminator.parameters())
@@ -125,16 +137,18 @@ def train(args):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # --- TensorBoard ---
+    writer = None
+    if HAS_TENSORBOARD:
+        log_dir = os.path.join(OUTPUT_DIR, "runs")
+        writer = SummaryWriter(log_dir)
+        print(f"TensorBoard: {log_dir}")
+
     best_val_loss = float('inf')
     total_steps = 0
 
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.time()
-
-        # Step schedulers at start of epoch (after previous epoch's optimizer steps)
-        if epoch > 1:
-            sched_g.step()
-            sched_d.step()
 
         # KL annealing weight (linear warmup)
         kl_w = KL_WEIGHT * min(1.0, epoch / max(1, KL_ANNEAL_EPOCHS))
@@ -172,7 +186,7 @@ def train(args):
                                           recon.detach().float(), condition.float())
                     d_total = d_loss + GP_WEIGHT * gp
                     scaler_d.scale(d_total).backward()
-                    scaler_d.unscale_(optimizer=opt_d)
+                    scaler_d.unscale_(opt_d)
                     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP)
                     scaler_d.step(opt_d)
                     scaler_d.update()
@@ -193,20 +207,20 @@ def train(args):
             if scaler_g is not None:
                 with torch.amp.autocast('cuda'):
                     recon, mu, logvar, condition = vae_gan(images, text_embeds)
-                    l1_loss, kl_loss = vae_loss(recon, images, mu, logvar, kl_w)
+                    l1_loss, kl_loss = vae_loss(recon, images, mu, logvar)
                     p_loss = perceptual(recon, images)
                     fake_logit_g = discriminator(recon, condition)
                     adv_loss = g_loss_fn(fake_logit_g)
                     g_total = (RECON_WEIGHT * l1_loss + kl_loss +
                                PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss)
                 scaler_g.scale(g_total).backward()
-                scaler_g.unscale_(optimizer=opt_g)
+                scaler_g.unscale_(opt_g)
                 torch.nn.utils.clip_grad_norm_(vae_gan.parameters(), GRAD_CLIP)
                 scaler_g.step(opt_g)
                 scaler_g.update()
             else:
                 recon, mu, logvar, condition = vae_gan(images, text_embeds)
-                l1_loss, kl_loss = vae_loss(recon, images, mu, logvar, kl_w)
+                l1_loss, kl_loss = vae_loss(recon, images, mu, logvar)
                 p_loss = perceptual(recon, images)
                 fake_logit_g = discriminator(recon, condition)
                 adv_loss = g_loss_fn(fake_logit_g)
@@ -261,12 +275,31 @@ def train(args):
                 images = images.to(DEVICE, non_blocking=True)
                 text_embeds = text_embeds.to(DEVICE, non_blocking=True)
                 recon, mu, logvar, _ = vae_gan(images, text_embeds)
-                l1, kl = vae_loss(recon, images, mu, logvar, kl_weight=kl_w)
-                val_total += (l1 + kl).item()
+                l1, kl = vae_loss(recon, images, mu, logvar)
+                p = perceptual(recon, images)
+                val_total += (l1 + kl_w * kl + PERCEPTUAL_WEIGHT * p).item()
                 n_val += 1
         val_loss = val_total / max(n_val, 1)
         print(f"  Val: {val_loss:.4f}" + (" (NaN!)" if (torch.isnan(torch.tensor(val_loss))
                or torch.isinf(torch.tensor(val_loss))) else ""))
+
+        # --- TensorBoard logging ---
+        if writer is not None:
+            writer.add_scalars('loss', {
+                'D': d_loss_sum / n_batches,
+                'G': g_loss_sum / n_batches,
+                'val': val_loss,
+            }, epoch)
+            writer.add_scalars('loss_detail', {
+                'L1': recon_sum / n_batches,
+                'KL': kl_sum / n_batches,
+                'perceptual': percep_sum / n_batches,
+                'adversarial': adv_sum / n_batches,
+            }, epoch)
+            writer.add_scalars('lr', {
+                'generator': lr_g,
+                'discriminator': lr_d,
+            }, epoch)
 
         if torch.isnan(torch.tensor(val_loss)) or torch.isinf(torch.tensor(val_loss)):
             print("  [WARN] Validation NaN — loading best checkpoint and reducing LR by 10x")
@@ -281,6 +314,10 @@ def train(args):
             for pg in opt_d.param_groups:
                 pg['lr'] *= 0.1
             continue
+
+        # Step schedulers at end of epoch
+        sched_g.step()
+        sched_d.step()
 
         # Save best
         if val_loss < best_val_loss:
@@ -314,6 +351,9 @@ def train(args):
 
     print(f"\nTraining complete! Best val_loss: {best_val_loss:.4f}")
     print(f"Model: {os.path.join(CHECKPOINT_DIR, 'best_model.pt')}")
+
+    if writer is not None:
+        writer.close()
 
 
 if __name__ == "__main__":
