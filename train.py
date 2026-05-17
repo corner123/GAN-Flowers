@@ -113,9 +113,36 @@ def train(args):
     opt_g = torch.optim.Adam(vae_gan.parameters(), lr=LR_G, betas=(BETA1, BETA2))
     opt_d = torch.optim.Adam(discriminator.parameters(), lr=LR_D, betas=(BETA1, BETA2))
 
+    # --- Resume from checkpoint ---
+    start_epoch = 1
+    resume_path = args.resume
+    if resume_path is None:
+        default_ckpt = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+        if os.path.exists(default_ckpt):
+            resume_path = default_ckpt
+
+    if resume_path and os.path.exists(resume_path):
+        print(f"Resuming from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=True)
+        vae_gan.load_state_dict(ckpt['vae_gan_state_dict'])
+        discriminator.load_state_dict(ckpt['discriminator_state_dict'])
+        # Restore optimizer state for continuous training
+        try:
+            opt_g.load_state_dict(ckpt['opt_g'])
+            opt_d.load_state_dict(ckpt['opt_d'])
+            print(f"  Optimizer states restored")
+        except Exception as e:
+            print(f"  [WARN] Could not restore optimizer state: {e}")
+            print(f"  Continuing with fresh optimizers (LR reset)")
+        start_epoch = ckpt.get('epoch', 0) + 1
+        print(f"  Resuming from epoch {start_epoch}")
+    else:
+        print("Training from scratch")
+
     # --- Schedulers ---
-    sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=EPOCHS)
-    sched_d = torch.optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=EPOCHS)
+    remaining_epochs = EPOCHS - start_epoch + 1
+    sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=max(remaining_epochs, 1))
+    sched_d = torch.optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=max(remaining_epochs, 1))
 
     # --- AMP ---
     scaler_g = torch.amp.GradScaler('cuda') if USE_AMP and DEVICE == "cuda" else None
@@ -128,7 +155,7 @@ def train(args):
     best_val_loss = float('inf')
     total_steps = 0
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch, EPOCHS + 1):
         epoch_start = time.time()
 
         # Step schedulers at start of epoch (after previous epoch's optimizer steps)
@@ -322,6 +349,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr_g", type=float, default=None)
     parser.add_argument("--lr_d", type=float, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from (default: checkpoints/best_model.pt)")
     args = parser.parse_args()
 
     import config
