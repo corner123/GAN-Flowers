@@ -66,8 +66,8 @@ class ResBlockUp(nn.Module):
         self.cond_proj = nn.Linear(condition_dim, out_ch * 2)
 
     def forward(self, x, condition):
-        x = self.upsample(x)
-        h = self.act(self.norm1(self.conv1(x)))
+        x_up = self.upsample(x)
+        h = self.act(self.norm1(self.conv1(x_up)))
         h = self.norm2(self.conv2(h))
 
         # Condition modulation
