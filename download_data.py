@@ -1,9 +1,7 @@
-"""
-下载 Flowers 数据集的辅助文件 + GloVe 词向量
-图片已放在 GAN/data/jpg/ 中
-"""
+"""Download Oxford-102 Flowers dataset + GloVe word vectors."""
 import os
 import sys
+import tarfile
 import urllib.request
 import zipfile
 import scipy.io as sio
@@ -23,9 +21,10 @@ class DownloadProgressBar(tqdm):
 
 def download_url(url, output_path):
     req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0'
     })
-    with DownloadProgressBar(unit='B', unit_scale=True, miniters=1, desc=url.split('/')[-1]) as t:
+    with DownloadProgressBar(unit='B', unit_scale=True, miniters=1,
+                             desc=url.split('/')[-1]) as t:
         response = urllib.request.urlopen(req)
         total_size = int(response.headers.get('content-length', 0))
         t.total = total_size
@@ -38,35 +37,75 @@ def download_url(url, output_path):
                 t.update(len(chunk))
 
 
+def download_images(data_dir):
+    """Download Oxford-102 flower images and extract them."""
+    images_dir = os.path.join(data_dir, "jpg")
+    os.makedirs(images_dir, exist_ok=True)
+
+    # Check if images already exist
+    existing = [f for f in os.listdir(images_dir) if f.endswith('.jpg')]
+    if len(existing) >= 800:
+        print(f"Images already exist: {len(existing)} files in {images_dir}")
+        return
+
+    # Download the 102 Category Flower Dataset images
+    url = "https://www.robots.ox.ac.uk/~vgg/data/flowers/102/102flowers.tgz"
+    tgz_path = os.path.join(data_dir, "102flowers.tgz")
+
+    print(f"Downloading Oxford-102 Flowers images (~328 MB)...")
+    download_url(url, tgz_path)
+
+    print("Extracting images...")
+    with tarfile.open(tgz_path, 'r:gz') as tar:
+        members = [m for m in tar.getmembers() if m.name.lower().endswith('.jpg')]
+        for member in tqdm(members, desc="Extracting", unit="img"):
+            # Rename: jpg/image_0001.jpg → jpg/image_00001.jpg (5-digit padding)
+            basename = os.path.basename(member.name)
+            # Original names like "image_00001.jpg"
+            target_name = basename
+            out_path = os.path.join(images_dir, target_name)
+            with tar.extractfile(member) as src:
+                with open(out_path, 'wb') as dst:
+                    dst.write(src.read())
+
+    os.remove(tgz_path)
+    n = len([f for f in os.listdir(images_dir) if f.endswith('.jpg')])
+    print(f"Extracted {n} images to {images_dir}")
+
+
 def prepare_flowers(data_dir):
-    """下载辅助文件并生成文字描述"""
+    """Download setid.mat, imagelabels.mat and generate captions.json."""
     os.makedirs(data_dir, exist_ok=True)
 
-    # 下载数据集划分
+    # setid.mat (train/val/test split)
     splits_path = os.path.join(data_dir, "setid.mat")
     if not os.path.exists(splits_path):
-        print("下载数据集划分文件...")
-        download_url("https://www.robots.ox.ac.uk/~vgg/data/flowers/102/setid.mat", splits_path)
+        print("Downloading setid.mat...")
+        download_url(
+            "https://www.robots.ox.ac.uk/~vgg/data/flowers/102/setid.mat",
+            splits_path)
 
-    # 下载标签
+    # imagelabels.mat
     labels_path = os.path.join(data_dir, "imagelabels.mat")
     if not os.path.exists(labels_path):
-        print("下载标签文件...")
-        download_url("https://www.robots.ox.ac.uk/~vgg/data/flowers/102/imagelabels.mat", labels_path)
+        print("Downloading imagelabels.mat...")
+        download_url(
+            "https://www.robots.ox.ac.uk/~vgg/data/flowers/102/imagelabels.mat",
+            labels_path)
 
-    # 生成文字描述
+    # captions.json
     captions_json = os.path.join(data_dir, "captions.json")
     if not os.path.exists(captions_json):
         generate_captions(data_dir)
 
 
 def generate_captions(data_dir):
-    """根据花卉类别生成简单文字描述"""
-    print("生成文字描述...")
+    """Generate text captions from flower labels."""
+    print("Generating captions...")
     images_dir = os.path.join(data_dir, "jpg")
-    image_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.jpg')])
+    image_files = sorted(
+        [f for f in os.listdir(images_dir) if f.endswith('.jpg')])
 
-    # 读取标签
     labels_path = os.path.join(data_dir, "imagelabels.mat")
     labels = None
     if os.path.exists(labels_path):
@@ -76,7 +115,6 @@ def generate_captions(data_dir):
         except Exception:
             pass
 
-    # 花卉描述模板
     colors = ["red", "pink", "white", "yellow", "purple", "blue", "orange"]
     types = ["rose", "daisy", "tulip", "sunflower", "orchid", "lily"]
 
@@ -94,66 +132,67 @@ def generate_captions(data_dir):
     json_path = os.path.join(data_dir, "captions.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(captions_dict, f, ensure_ascii=False, indent=2)
-    print(f"已生成 {json_path}，共 {len(captions_dict)} 张图片")
+    print(f"Saved {json_path} ({len(captions_dict)} images)")
 
 
 def download_glove(glove_dir):
-    """下载 GloVe 6B 50d 词向量"""
+    """Download GloVe 6B 50d (~170 MB)."""
     os.makedirs(glove_dir, exist_ok=True)
     glove_txt = os.path.join(glove_dir, "glove.6B.50d.txt")
 
     if os.path.exists(glove_txt):
-        print(f"GloVe 词向量已存在: {glove_txt}")
+        print(f"GloVe already exists: {glove_txt}")
         return
 
-    print("下载 GloVe 6B 词向量 (~100MB)...")
+    print("Downloading GloVe 6B (~100 MB zip)...")
     zip_path = os.path.join(glove_dir, "glove.6B.zip")
     download_url("https://nlp.stanford.edu/data/glove.6B.zip", zip_path)
 
-    print("解压 GloVe...")
+    print("Extracting GloVe...")
     with zipfile.ZipFile(zip_path, 'r') as z:
         z.extractall(glove_dir)
     os.remove(zip_path)
-    print(f"GloVe 已解压到 {glove_dir}")
+    print(f"GloVe extracted to {glove_dir}")
 
 
 def verify_data(data_dir, glove_path):
-    print("\n=== 数据校验 ===")
+    print("\n=== Data verification ===")
 
     images_dir = os.path.join(data_dir, "jpg")
     if os.path.exists(images_dir):
-        n_images = len([f for f in os.listdir(images_dir) if f.endswith('.jpg')])
-        print(f"图片: {n_images} 张")
+        n = len([f for f in os.listdir(images_dir) if f.endswith('.jpg')])
+        print(f"Images: {n}")
     else:
-        print("图片目录不存在!")
+        print("Images dir missing!")
         return False
 
     captions_json = os.path.join(data_dir, "captions.json")
     if os.path.exists(captions_json):
         with open(captions_json, 'r') as f:
             caps = json.load(f)
-        print(f"文字描述: {len(caps)} 条")
+        print(f"Captions: {len(caps)}")
     else:
-        print("文字描述文件不存在!")
+        print("Captions file missing!")
         return False
 
     if os.path.exists(glove_path):
         with open(glove_path, 'r', encoding='utf-8') as f:
-            n_lines = sum(1 for _ in f)
-        print(f"GloVe 词向量: {n_lines} 个词")
+            n = sum(1 for _ in f)
+        print(f"GloVe: {n} words")
     else:
-        print("GloVe 文件不存在!")
+        print("GloVe file missing!")
         return False
 
-    print("校验通过!")
+    print("All OK!")
     return True
 
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("Text-to-Image cVAE - 数据准备")
+    print("VAE-GAN Text-to-Image — Data Preparation")
     print("=" * 50)
 
+    download_images(DATA_DIR)
     prepare_flowers(DATA_DIR)
     download_glove(GLOVE_DIR)
     verify_data(DATA_DIR, GLOVE_PATH)
