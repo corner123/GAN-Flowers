@@ -131,6 +131,11 @@ def train(args):
     for epoch in range(1, EPOCHS + 1):
         epoch_start = time.time()
 
+        # Step schedulers at start of epoch (after previous epoch's optimizer steps)
+        if epoch > 1:
+            sched_g.step()
+            sched_d.step()
+
         # KL annealing weight (linear warmup)
         kl_w = KL_WEIGHT * min(1.0, epoch / max(1, KL_ANNEAL_EPOCHS))
 
@@ -226,9 +231,6 @@ def train(args):
                 })
 
         # --- End of epoch ---
-        sched_g.step()
-        sched_d.step()
-
         n_batches = len(train_loader)
         elapsed = time.time() - epoch_start
         lr_g = sched_g.get_last_lr()[0]
@@ -249,7 +251,7 @@ def train(args):
                 images = images.to(DEVICE, non_blocking=True)
                 text_embeds = text_embeds.to(DEVICE, non_blocking=True)
                 recon, mu, logvar, _ = vae_gan(images, text_embeds)
-                l1, kl = vae_loss(recon, images, mu, logvar, kl_w=kl_w)
+                l1, kl = vae_loss(recon, images, mu, logvar, kl_weight=kl_w)
                 val_total += (l1 + kl).item()
                 n_val += 1
         val_loss = val_total / max(n_val, 1)
