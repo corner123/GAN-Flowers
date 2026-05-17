@@ -120,17 +120,18 @@ class TextEncoder(nn.Module):
 # ═══════════════════════════════════════════════
 
 class Encoder(nn.Module):
-    """128×128×3 → μ, logσ² (each latent_dim)."""
+    """Image → μ, logσ² (6 downsamples → 4×4)."""
     def __init__(self, base_ch=64, latent_dim=256):
         super().__init__()
         c = base_ch
         self.head = nn.Conv2d(3, c, 3, 1, 1, bias=False)
-        # 128 → 64
-        self.d1 = ResBlockDown(c, c * 2)     # 64  → 32
-        self.d2 = ResBlockDown(c * 2, c * 4) # 32  → 16
-        self.d3 = ResBlockDown(c * 4, c * 8) # 16  → 8
-        self.d4 = ResBlockDown(c * 8, c * 8) # 16  → 8
-        self.d5 = ResBlockDown(c * 8, c * 8) # 8   → 4
+        # 256 → 128 → 64 → 32 → 16 → 8 → 4
+        self.d1 = ResBlockDown(c, c * 2)     # 256 → 128
+        self.d2 = ResBlockDown(c * 2, c * 4) # 128 → 64
+        self.d3 = ResBlockDown(c * 4, c * 8) # 64  → 32
+        self.d4 = ResBlockDown(c * 8, c * 8) # 32  → 16
+        self.d5 = ResBlockDown(c * 8, c * 8) # 16  → 8
+        self.d6 = ResBlockDown(c * 8, c * 8) # 8   → 4
         self.flatten = nn.Flatten()
         self.fc_mu = nn.Linear(c * 8 * 4 * 4, latent_dim)
         self.fc_logvar = nn.Linear(c * 8 * 4 * 4, latent_dim)
@@ -142,6 +143,7 @@ class Encoder(nn.Module):
         h = self.d3(h)
         h = self.d4(h)
         h = self.d5(h)
+        h = self.d6(h)
         h = self.flatten(h)
         return self.fc_mu(h), self.fc_logvar(h)
 
@@ -151,7 +153,7 @@ class Encoder(nn.Module):
 # ═══════════════════════════════════════════════
 
 class Decoder(nn.Module):
-    """z(256) + condition(256) → 128×128×3."""
+    """z + condition → 256×256×3 (6 upsamples from 4×4)."""
     def __init__(self, latent_dim=256, condition_dim=256, base_ch=64):
         super().__init__()
         c = base_ch
@@ -159,12 +161,13 @@ class Decoder(nn.Module):
             nn.Linear(latent_dim + condition_dim, c * 8 * 4 * 4),
             nn.ReLU(inplace=True),
         )
-        # 4 → 8  → 16  → 32  → 64  → 128
+        # 4 → 8  → 16  → 32  → 64  → 128 → 256
         self.u1 = ResBlockUp(c * 8, c * 8, condition_dim)
         self.u2 = ResBlockUp(c * 8, c * 4, condition_dim)
         self.u3 = ResBlockUp(c * 4, c * 2, condition_dim)
         self.u4 = ResBlockUp(c * 2, c, condition_dim)
         self.u5 = ResBlockUp(c, c, condition_dim)
+        self.u6 = ResBlockUp(c, c, condition_dim)
         self.tail = nn.Sequential(
             nn.Conv2d(c, 3, 3, 1, 1),
             nn.Tanh(),
@@ -178,6 +181,7 @@ class Decoder(nn.Module):
         h = self.u3(h, condition)
         h = self.u4(h, condition)
         h = self.u5(h, condition)
+        h = self.u6(h, condition)
         return self.tail(h)
 
 
@@ -186,7 +190,7 @@ class Decoder(nn.Module):
 # ═══════════════════════════════════════════════
 
 class Discriminator(nn.Module):
-    """128×128×3 + condition → real/fake logit.
+    """256×256×3 + condition → real/fake logit (6 downsample layers).
 
     Uses projection discrimination: the condition embedding is dot-producted
     with the final feature map to produce a condition-aware score.
@@ -195,11 +199,12 @@ class Discriminator(nn.Module):
         super().__init__()
         c = base_ch
         self.head = nn.utils.spectral_norm(nn.Conv2d(3, c, 3, 1, 1, bias=False))
-        self.d1 = ResBlockDown(c, c * 2)           # 128→64
-        self.d2 = ResBlockDown(c * 2, c * 4)       # 64→32
-        self.d3 = ResBlockDown(c * 4, c * 8)       # 32→16
-        self.d4 = ResBlockDown(c * 8, c * 8)       # 16→8
-        self.d5 = ResBlockDown(c * 8, c * 8)       # 8→4
+        self.d1 = ResBlockDown(c, c * 2)           # 256→128
+        self.d2 = ResBlockDown(c * 2, c * 4)       # 128→64
+        self.d3 = ResBlockDown(c * 4, c * 8)       # 64→32
+        self.d4 = ResBlockDown(c * 8, c * 8)       # 32→16
+        self.d5 = ResBlockDown(c * 8, c * 8)       # 16→8
+        self.d6 = ResBlockDown(c * 8, c * 8)       # 8→4
 
         self.act = nn.LeakyReLU(0.2, inplace=True)
         self.flatten = nn.Flatten()
@@ -218,6 +223,7 @@ class Discriminator(nn.Module):
         h = self.d3(h)
         h = self.d4(h)
         h = self.d5(h)
+        h = self.d6(h)
         h = self.flatten(h)
         out = self.fc_out(h)
 
