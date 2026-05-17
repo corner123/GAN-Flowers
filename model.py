@@ -125,10 +125,10 @@ class Encoder(nn.Module):
         super().__init__()
         c = base_ch
         self.head = nn.Conv2d(3, c, 3, 1, 1, bias=False)
-        # 128 → 64
-        self.d1 = ResBlockDown(c, c * 2)     # 64  → 32
-        self.d2 = ResBlockDown(c * 2, c * 4) # 32  → 16
-        self.d3 = ResBlockDown(c * 4, c * 8) # 16  → 8
+        # 128 → 64 → 32 → 16 → 8 → 4
+        self.d1 = ResBlockDown(c, c * 2)     # 128 → 64
+        self.d2 = ResBlockDown(c * 2, c * 4) # 64  → 32
+        self.d3 = ResBlockDown(c * 4, c * 8) # 32  → 16
         self.d4 = ResBlockDown(c * 8, c * 8) # 16  → 8
         self.d5 = ResBlockDown(c * 8, c * 8) # 8   → 4
         self.flatten = nn.Flatten()
@@ -316,7 +316,7 @@ class VaeGan(nn.Module):
 #  Loss helpers
 # ═══════════════════════════════════════════════
 
-def vae_loss(recon, target, mu, logvar, kl_weight=0.0001):
+def vae_loss(recon, target, mu, logvar):
     """L1 reconstruction + KL divergence."""
     recon_loss = F.l1_loss(recon, target)
     kl_loss = -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
@@ -351,3 +351,21 @@ def gradient_penalty(discriminator, real_images, fake_images, condition):
 
     gradients = gradients.view(batch, -1)
     return ((gradients.norm(2, dim=1) - 1.0) ** 2).mean()
+
+
+def weights_init(m):
+    """He init for Conv/Linear, ones for Norm biases."""
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+    elif classname.find('Linear') != -1:
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif classname.find('InstanceNorm') != -1:
+        if hasattr(m, 'weight') and m.weight is not None:
+            nn.init.ones_(m.weight)
+        if hasattr(m, 'bias') and m.bias is not None:
+            nn.init.zeros_(m.bias)

@@ -42,10 +42,10 @@ class FlowersDataset(Dataset):
     """Oxford-102 Flowers with optional data augmentation."""
 
     def __init__(self, data_dir, glove_path, split="train",
-                 image_size=128, glove_dim=50, augment=False):
+                 image_size=128, glove_dim=50, augment=False, glove=None):
         self.data_dir = data_dir
         self.image_size = image_size
-        self.glove = GloVeEmbedding(glove_path, glove_dim)
+        self.glove = glove if glove is not None else GloVeEmbedding(glove_path, glove_dim)
 
         images_dir = os.path.join(data_dir, "jpg")
         captions_path = os.path.join(data_dir, "captions.json")
