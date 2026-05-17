@@ -129,7 +129,8 @@ class Encoder(nn.Module):
         self.d1 = ResBlockDown(c, c * 2)     # 64  → 32
         self.d2 = ResBlockDown(c * 2, c * 4) # 32  → 16
         self.d3 = ResBlockDown(c * 4, c * 8) # 16  → 8
-        self.d4 = ResBlockDown(c * 8, c * 8) # 8   → 4
+        self.d4 = ResBlockDown(c * 8, c * 8) # 16  → 8
+        self.d5 = ResBlockDown(c * 8, c * 8) # 8   → 4
         self.flatten = nn.Flatten()
         self.fc_mu = nn.Linear(c * 8 * 4 * 4, latent_dim)
         self.fc_logvar = nn.Linear(c * 8 * 4 * 4, latent_dim)
@@ -140,6 +141,7 @@ class Encoder(nn.Module):
         h = self.d2(h)
         h = self.d3(h)
         h = self.d4(h)
+        h = self.d5(h)
         h = self.flatten(h)
         return self.fc_mu(h), self.fc_logvar(h)
 

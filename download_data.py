@@ -93,9 +93,17 @@ def prepare_flowers(data_dir):
             "https://www.robots.ox.ac.uk/~vgg/data/flowers/102/imagelabels.mat",
             labels_path)
 
-    # captions.json
+    # captions.json — regenerate if missing or image count changed
     captions_json = os.path.join(data_dir, "captions.json")
-    if not os.path.exists(captions_json):
+    images_dir = os.path.join(data_dir, "jpg")
+    n_images = len([f for f in os.listdir(images_dir) if f.endswith('.jpg')]) if os.path.exists(images_dir) else 0
+    if os.path.exists(captions_json):
+        with open(captions_json, 'r') as f:
+            n_caps = len(json.load(f))
+        if n_caps != n_images:
+            print(f"Captions count mismatch ({n_caps} vs {n_images} images), regenerating...")
+            generate_captions(data_dir)
+    else:
         generate_captions(data_dir)
 
 
