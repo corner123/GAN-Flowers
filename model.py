@@ -194,7 +194,7 @@ class Discriminator(nn.Module):
     def __init__(self, base_ch=64, condition_dim=256):
         super().__init__()
         c = base_ch
-        self.head = nn.Conv2d(3, c, 3, 1, 1, bias=False)
+        self.head = nn.utils.spectral_norm(nn.Conv2d(3, c, 3, 1, 1, bias=False))
         self.d1 = ResBlockDown(c, c * 2)           # 128→64
         self.d2 = ResBlockDown(c * 2, c * 4)       # 64→32
         self.d3 = ResBlockDown(c * 4, c * 8)       # 32→16
@@ -203,7 +203,8 @@ class Discriminator(nn.Module):
 
         self.act = nn.LeakyReLU(0.2, inplace=True)
         self.flatten = nn.Flatten()
-        self.fc_out = nn.Linear(c * 8 * 4 * 4, 1)
+        self.fc_out = nn.utils.spectral_norm(
+            nn.Linear(c * 8 * 4 * 4, 1))
 
         # Projection head: condition → feature-space embedding
         self.cond_proj = nn.utils.spectral_norm(
@@ -220,9 +221,10 @@ class Discriminator(nn.Module):
         h = self.flatten(h)
         out = self.fc_out(h)
 
-        # Projection: inner product of condition embedding and image features
+        # Projection with normalization to prevent explosion
         cond_emb = self.cond_proj(condition)
-        out = out + (h * cond_emb).sum(dim=1, keepdim=True)
+        feat_dim = h.shape[1]
+        out = out + (h * cond_emb).sum(dim=1, keepdim=True) / (feat_dim ** 0.5)
         return out
 
 

@@ -35,7 +35,10 @@ KL_WEIGHT = 0.0001           # KL divergence
 ADV_WEIGHT = 0.5             # Adversarial loss for G
 PERCEPTUAL_WEIGHT = 0.1      # Perceptual (VGG) loss
 RECON_WEIGHT = 1.0           # L1 reconstruction
-GP_WEIGHT = 10.0             # Gradient penalty (WGAN-GP)
+GP_WEIGHT = 2.0              # Gradient penalty (reduced for stability)
+
+# Gradient clipping
+GRAD_CLIP = 1.0              # max gradient norm (prevents explosion)
 
 # KL annealing
 KL_ANNEAL_EPOCHS = 100       # linearly increase KL weight over this many epochs

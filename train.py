@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (DATA_DIR, GLOVE_PATH, IMAGE_SIZE, LATENT_DIM, TEXT_EMBED_DIM,
                     CONDITION_DIM, BASE_CHANNELS, BATCH_SIZE, EPOCHS,
                     LR_G, LR_D, BETA1, BETA2, KL_WEIGHT, ADV_WEIGHT,
-                    PERCEPTUAL_WEIGHT, RECON_WEIGHT, GP_WEIGHT,
+                    PERCEPTUAL_WEIGHT, RECON_WEIGHT, GP_WEIGHT, GRAD_CLIP,
                     KL_ANNEAL_EPOCHS, USE_AMP, LOG_INTERVAL,
                     SAVE_INTERVAL, SAMPLE_INTERVAL, N_SAMPLES,
                     DEVICE, OUTPUT_DIR, CHECKPOINT_DIR)
@@ -163,13 +163,17 @@ def train(args):
                 opt_d.zero_grad(set_to_none=True)
 
                 if scaler_d is not None:
+                    # GP uses autograd.grad (2nd-order) — keep in FP32
                     with torch.amp.autocast('cuda'):
                         real_logit = discriminator(images, condition)
                         fake_logit = discriminator(recon.detach(), condition)
                         d_loss = d_loss_fn(real_logit, fake_logit)
-                        gp = gradient_penalty(discriminator, images, recon.detach(), condition)
-                        d_total = d_loss + GP_WEIGHT * gp
+                    gp = gradient_penalty(discriminator, images.float(),
+                                          recon.detach().float(), condition.float())
+                    d_total = d_loss + GP_WEIGHT * gp
                     scaler_d.scale(d_total).backward()
+                    scaler_d.unscale_(optimizer=opt_d)
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP)
                     scaler_d.step(opt_d)
                     scaler_d.update()
                 else:
@@ -178,6 +182,7 @@ def train(args):
                     d_loss = d_loss_fn(real_logit, fake_logit)
                     gp = gradient_penalty(discriminator, images, recon.detach(), condition)
                     (d_loss + GP_WEIGHT * gp).backward()
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP)
                     opt_d.step()
 
             # ═══════════════════════════════════
@@ -188,16 +193,15 @@ def train(args):
             if scaler_g is not None:
                 with torch.amp.autocast('cuda'):
                     recon, mu, logvar, condition = vae_gan(images, text_embeds)
-                    # Reconstruction losses
                     l1_loss, kl_loss = vae_loss(recon, images, mu, logvar, kl_w)
                     p_loss = perceptual(recon, images)
-                    # Adversarial loss
                     fake_logit_g = discriminator(recon, condition)
                     adv_loss = g_loss_fn(fake_logit_g)
-                    # Total
                     g_total = (RECON_WEIGHT * l1_loss + kl_loss +
                                PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss)
                 scaler_g.scale(g_total).backward()
+                scaler_g.unscale_(optimizer=opt_g)
+                torch.nn.utils.clip_grad_norm_(vae_gan.parameters(), GRAD_CLIP)
                 scaler_g.step(opt_g)
                 scaler_g.update()
             else:
@@ -209,7 +213,13 @@ def train(args):
                 g_total = (RECON_WEIGHT * l1_loss + kl_loss +
                            PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss)
                 g_total.backward()
+                torch.nn.utils.clip_grad_norm_(vae_gan.parameters(), GRAD_CLIP)
                 opt_g.step()
+
+            # NaN detection: skip tracking if exploded
+            if torch.isnan(g_total) or torch.isinf(g_total):
+                print(f"\n  [WARN] NaN/Inf detected at batch {batch_idx+1}, epoch {epoch}")
+                continue
 
             # Track losses
             d_loss_sum += d_loss.item()
@@ -255,7 +265,22 @@ def train(args):
                 val_total += (l1 + kl).item()
                 n_val += 1
         val_loss = val_total / max(n_val, 1)
-        print(f"  Val: {val_loss:.4f}")
+        print(f"  Val: {val_loss:.4f}" + (" (NaN!)" if (torch.isnan(torch.tensor(val_loss))
+               or torch.isinf(torch.tensor(val_loss))) else ""))
+
+        if torch.isnan(torch.tensor(val_loss)) or torch.isinf(torch.tensor(val_loss)):
+            print("  [WARN] Validation NaN — loading best checkpoint and reducing LR by 10x")
+            # Try to recover: reload best model, reduce learning rates
+            best_path = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+            if os.path.exists(best_path):
+                ckpt = torch.load(best_path, map_location=DEVICE, weights_only=True)
+                vae_gan.load_state_dict(ckpt['vae_gan_state_dict'])
+                discriminator.load_state_dict(ckpt['discriminator_state_dict'])
+            for pg in opt_g.param_groups:
+                pg['lr'] *= 0.1
+            for pg in opt_d.param_groups:
+                pg['lr'] *= 0.1
+            continue
 
         # Save best
         if val_loss < best_val_loss:
