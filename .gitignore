@@ -1,0 +1,30 @@
+# Checkpoints & outputs (large files)
+checkpoints/
+outputs/
+
+# Data
+data/jpg/
+data/glove/
+data/setid.mat
+data/imagelabels.mat
+data/*.mat
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# System
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
