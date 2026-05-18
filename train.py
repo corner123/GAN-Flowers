@@ -226,7 +226,7 @@ def train(args):
                     p_loss = perceptual(recon, images)
                     fake_logit_g = discriminator(recon, condition)
                     adv_loss = g_loss_fn(fake_logit_g)
-                    m_loss = matching_loss(condition, mu)
+                    m_loss = matching_loss(condition, mu, vae_gan.matching_proj)
                     g_total = (RECON_WEIGHT * l1_loss + kl_loss +
                                PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss +
                                MATCH_WEIGHT * m_loss)

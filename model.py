@@ -342,6 +342,8 @@ class VaeGan(nn.Module):
         self.encoder = Encoder(base_ch, latent_dim)
         self.decoder = Decoder(latent_dim, condition_dim, base_ch)
         self.latent_dim = latent_dim
+        # Project latent mu to condition_dim for matching loss
+        self.matching_proj = nn.Linear(latent_dim, condition_dim)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -382,15 +384,17 @@ def vae_loss(recon, target, mu, logvar, kl_weight=0.0001):
     return recon_loss, kl_loss
 
 
-def matching_loss(condition, image_features):
+def matching_loss(condition, image_features, proj=None):
     """Cosine similarity matching loss between text condition and image features.
 
-    Forces the generated image features to align with the text condition,
-    preventing the model from ignoring text input.
+    Projects image_features to condition dimension if needed,
+    then forces alignment to prevent the model from ignoring text input.
     """
+    if proj is not None:
+        image_features = proj(image_features)
+
     condition_norm = F.normalize(condition, dim=1)
     image_norm = F.normalize(image_features, dim=1)
-    # Cosine similarity → want to maximize, so minimize negative
     return -torch.mean(torch.sum(condition_norm * image_norm, dim=1))
 
 
