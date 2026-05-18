@@ -1,16 +1,16 @@
-"""VAE-GAN for Text-to-Image Generation.
+"""VAE-GAN for Text-to-Image Generation (v2 — CLIP + Cross-Attention).
 
 Architecture:
-  TextEncoder:  GloVe 50d → condition vector (256d)
+  TextEncoder:  CLIP ViT-B/32 → condition vector (512d)
   Encoder:      128x128x3 → μ, logσ² (latent_dim=256)
-  Decoder:      z(256) + condition(256) → 128×128×3   (generator)
-  Discriminator: 128×128×3 + condition(256) → real/fake logit
+  Decoder:      z(256) + condition(512) → 128×128×3   (generator)
+  Discriminator: 128×128×3 + condition(512) → real/fake logit
 
-Losses:
-  - L1 reconstruction
-  - Perceptual (VGG16 feature matching)
-  - KL divergence (annealed)
-  - Adversarial (hinge loss + gradient penalty)
+v2 improvements:
+  - CLIP text encoder (512d contextual embeddings, not GloVe 50d)
+  - Cross-attention layers in decoder for fine-grained text-image alignment
+  - Matching loss (text-image cosine similarity) to enforce conditioning
+  - Stronger adversarial loss weight
 """
 import torch
 import torch.nn as nn
@@ -96,23 +96,80 @@ class ResBlockPlain(nn.Module):
 
 
 # ═══════════════════════════════════════════════
-#  Text Encoder
+#  Cross-Attention (for text conditioning)
+# ═══════════════════════════════════════════════
+
+class CrossAttention(nn.Module):
+    """Cross-attention: image features attend to text embeddings.
+
+    Q from image features, K/V from text embedding.
+    Applied on spatial feature maps reshaped to sequence.
+    """
+    def __init__(self, feat_dim, text_dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = feat_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(feat_dim, feat_dim)
+        self.k_proj = nn.Linear(text_dim, feat_dim)
+        self.v_proj = nn.Linear(text_dim, feat_dim)
+        self.out_proj = nn.Linear(feat_dim, feat_dim)
+        self.norm = nn.LayerNorm(feat_dim)
+
+    def forward(self, feat, text_embed):
+        """
+        feat: (B, C, H, W) spatial features
+        text_embed: (B, text_dim) or (B, N, text_dim) token embeddings
+        """
+        B, C, H, W = feat.shape
+        # Reshape to (B, H*W, C)
+        feat_flat = feat.view(B, C, H * W).permute(0, 2, 1)
+        residual = feat_flat
+
+        # If text_embed is 2D, add a token dimension
+        if text_embed.dim() == 2:
+            text_embed = text_embed.unsqueeze(1)  # (B, 1, text_dim)
+
+        # Q from image, K/V from text
+        q = self.q_proj(feat_flat).view(B, H * W, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(text_embed).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(text_embed).view(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).permute(0, 2, 1, 3).reshape(B, H * W, C)
+
+        out = self.out_proj(out)
+        out = self.norm(out + residual)
+
+        # Reshape back to (B, C, H, W)
+        return out.permute(0, 2, 1).view(B, C, H, W)
+
+
+# ═══════════════════════════════════════════════
+#  Text Encoder (CLIP)
 # ═══════════════════════════════════════════════
 
 class TextEncoder(nn.Module):
-    """GloVe 50d → condition vector."""
-    def __init__(self, text_dim=50, hidden_dim=512, condition_dim=256):
+    """CLIP ViT-B/32 text encoder → 512d condition vector.
+
+    Frozen CLIP produces high-quality text embeddings that capture
+    semantic meaning far better than GloVe mean-pooling.
+    """
+    def __init__(self, text_dim=512, condition_dim=512):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, condition_dim),
+        # Projection from CLIP dim to condition dim
+        self.proj = nn.Sequential(
+            nn.Linear(text_dim, condition_dim),
+            nn.GELU(),
+            nn.Linear(condition_dim, condition_dim),
         )
 
     def forward(self, text_embed):
-        return self.net(text_embed)
+        """text_embed: (B, 512) CLIP embedding"""
+        return self.proj(text_embed)
 
 
 # ═══════════════════════════════════════════════
@@ -125,10 +182,10 @@ class Encoder(nn.Module):
         super().__init__()
         c = base_ch
         self.head = nn.Conv2d(3, c, 3, 1, 1, bias=False)
-        # 128 → 64
-        self.d1 = ResBlockDown(c, c * 2)     # 64  → 32
-        self.d2 = ResBlockDown(c * 2, c * 4) # 32  → 16
-        self.d3 = ResBlockDown(c * 4, c * 8) # 16  → 8
+        # 128 → 64 → 32 → 16 → 8 → 4
+        self.d1 = ResBlockDown(c, c * 2)     # 128 → 64
+        self.d2 = ResBlockDown(c * 2, c * 4) # 64  → 32
+        self.d3 = ResBlockDown(c * 4, c * 8) # 32  → 16
         self.d4 = ResBlockDown(c * 8, c * 8) # 16  → 8
         self.d5 = ResBlockDown(c * 8, c * 8) # 8   → 4
         self.flatten = nn.Flatten()
@@ -147,12 +204,16 @@ class Encoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════
-#  Decoder (Generator)
+#  Decoder (Generator) with Cross-Attention
 # ═══════════════════════════════════════════════
 
 class Decoder(nn.Module):
-    """z(256) + condition(256) → 128×128×3."""
-    def __init__(self, latent_dim=256, condition_dim=256, base_ch=64):
+    """z(256) + condition(512) → 128×128×3.
+
+    v2: Added cross-attention at 8×8 and 16×16 resolutions
+    for fine-grained text-image alignment.
+    """
+    def __init__(self, latent_dim=256, condition_dim=512, base_ch=64):
         super().__init__()
         c = base_ch
         self.fc = nn.Sequential(
@@ -165,6 +226,11 @@ class Decoder(nn.Module):
         self.u3 = ResBlockUp(c * 4, c * 2, condition_dim)
         self.u4 = ResBlockUp(c * 2, c, condition_dim)
         self.u5 = ResBlockUp(c, c, condition_dim)
+
+        # Cross-attention at 8×8 and 16×16 for text alignment
+        self.cross_attn_8 = CrossAttention(c * 4, condition_dim, num_heads=4)
+        self.cross_attn_16 = CrossAttention(c * 2, condition_dim, num_heads=4)
+
         self.tail = nn.Sequential(
             nn.Conv2d(c, 3, 3, 1, 1),
             nn.Tanh(),
@@ -173,11 +239,13 @@ class Decoder(nn.Module):
     def forward(self, z, condition):
         h = torch.cat([z, condition], dim=1)
         h = self.fc(h).view(-1, 512, 4, 4)
-        h = self.u1(h, condition)
-        h = self.u2(h, condition)
-        h = self.u3(h, condition)
-        h = self.u4(h, condition)
-        h = self.u5(h, condition)
+        h = self.u1(h, condition)                    # 4→8
+        h = self.u2(h, condition)                    # 8→16
+        h = self.cross_attn_8(h, condition)          # cross-attn at 8×8
+        h = self.u3(h, condition)                    # 16→32
+        h = self.cross_attn_16(h, condition)         # cross-attn at 16×16
+        h = self.u4(h, condition)                    # 32→64
+        h = self.u5(h, condition)                    # 64→128
         return self.tail(h)
 
 
@@ -191,7 +259,7 @@ class Discriminator(nn.Module):
     Uses projection discrimination: the condition embedding is dot-producted
     with the final feature map to produce a condition-aware score.
     """
-    def __init__(self, base_ch=64, condition_dim=256):
+    def __init__(self, base_ch=64, condition_dim=512):
         super().__init__()
         c = base_ch
         self.head = nn.utils.spectral_norm(nn.Conv2d(3, c, 3, 1, 1, bias=False))
@@ -244,14 +312,12 @@ class PerceptualLoss(nn.Module):
         for blk in self.blocks:
             for p in blk.parameters():
                 p.requires_grad = False
-        # VGG expects ImageNet-normalized inputs
         self.register_buffer(
             'mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer(
             'std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, fake, real):
-        # Map from [-1, 1] to [0, 1] for VGG normalization
         fake = (fake * 0.5 + 0.5)
         real = (real * 0.5 + 0.5)
         fake = (fake - self.mean) / self.std
@@ -269,10 +335,10 @@ class PerceptualLoss(nn.Module):
 # ═══════════════════════════════════════════════
 
 class VaeGan(nn.Module):
-    """Conditional VAE-GAN for Text-to-Image."""
-    def __init__(self, latent_dim=256, text_dim=50, condition_dim=256, base_ch=64):
+    """Conditional VAE-GAN for Text-to-Image (v2 with CLIP)."""
+    def __init__(self, latent_dim=256, text_dim=512, condition_dim=512, base_ch=64):
         super().__init__()
-        self.text_encoder = TextEncoder(text_dim, condition_dim=condition_dim)
+        self.text_encoder = TextEncoder(text_dim, condition_dim)
         self.encoder = Encoder(base_ch, latent_dim)
         self.decoder = Decoder(latent_dim, condition_dim, base_ch)
         self.latent_dim = latent_dim
@@ -291,14 +357,7 @@ class VaeGan(nn.Module):
 
     @torch.no_grad()
     def generate(self, text_embed, num_images=None, temperature=1.0, device="cuda"):
-        """Generate images from text description.
-
-        Args:
-            text_embed: (N, text_dim) or (1, text_dim)
-            num_images: how many images to generate (default: len(text_embed))
-            temperature: scaling factor for latent sampling std (1.0=default, >1=more diverse)
-            device: target device
-        """
+        """Generate images from text description."""
         self.eval()
         condition = self.text_encoder(text_embed.to(device))
         if num_images is None:
@@ -323,6 +382,18 @@ def vae_loss(recon, target, mu, logvar, kl_weight=0.0001):
     return recon_loss, kl_loss
 
 
+def matching_loss(condition, image_features):
+    """Cosine similarity matching loss between text condition and image features.
+
+    Forces the generated image features to align with the text condition,
+    preventing the model from ignoring text input.
+    """
+    condition_norm = F.normalize(condition, dim=1)
+    image_norm = F.normalize(image_features, dim=1)
+    # Cosine similarity → want to maximize, so minimize negative
+    return -torch.mean(torch.sum(condition_norm * image_norm, dim=1))
+
+
 def d_loss_fn(real_logit, fake_logit):
     """Hinge loss for discriminator."""
     real_loss = F.relu(1.0 - real_logit).mean()
@@ -336,7 +407,7 @@ def g_loss_fn(fake_logit):
 
 
 def gradient_penalty(discriminator, real_images, fake_images, condition):
-    """WGAN-GP gradient penalty (unconditional on condition for simplicity)."""
+    """WGAN-GP gradient penalty."""
     batch = real_images.size(0)
     alpha = torch.rand(batch, 1, 1, 1, device=real_images.device)
     interpolates = (alpha * real_images + (1 - alpha) * fake_images).requires_grad_(True)

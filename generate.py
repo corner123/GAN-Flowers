@@ -1,4 +1,4 @@
-"""Text-to-Image inference with VAE-GAN."""
+"""Text-to-Image inference with VAE-GAN (v2 — CLIP)."""
 import os
 import sys
 import argparse
@@ -7,30 +7,21 @@ import torch
 from torchvision.utils import save_image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import (GLOVE_PATH, IMAGE_SIZE, LATENT_DIM, TEXT_EMBED_DIM,
+from config import (IMAGE_SIZE, LATENT_DIM, TEXT_EMBED_DIM,
                     CONDITION_DIM, BASE_CHANNELS, DEVICE,
                     CHECKPOINT_DIR, OUTPUT_DIR)
 from model import VaeGan
-from dataset import load_glove_for_inference
+from dataset import encode_text_clip
 
 
 def generate_from_text(text, model_path=None, num_images=4, temperature=1.0, seed=None):
-    """Generate images from a text description.
-
-    Args:
-        text: input description (e.g., "a red rose")
-        model_path: path to checkpoint (default: best_model.pt)
-        num_images: number of images to generate
-        temperature: latent sampling noise scale (>1 = more diverse, <1 = sharper)
-        seed: random seed for reproducibility
-    """
+    """Generate images from a text description using CLIP encoding."""
     if seed is not None:
         torch.manual_seed(seed)
 
-    glove = load_glove_for_inference(GLOVE_PATH, TEXT_EMBED_DIM)
-    text_embed = torch.from_numpy(glove.encode_sentence(text)).unsqueeze(0)
-
     print(f"Text: \"{text}\"")
+    print("Encoding text with CLIP...")
+    text_embed = encode_text_clip(text).unsqueeze(0)
     print(f"Embedding: {text_embed.shape}")
 
     model = VaeGan(latent_dim=LATENT_DIM, text_dim=TEXT_EMBED_DIM,
@@ -66,7 +57,7 @@ def generate_from_text(text, model_path=None, num_images=4, temperature=1.0, see
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VAE-GAN Text-to-Image")
+    parser = argparse.ArgumentParser(description="VAE-GAN Text-to-Image (CLIP)")
     parser.add_argument("--text", type=str, default="a red rose",
                         help="Text description")
     parser.add_argument("--model", type=str, default=None,

@@ -1,4 +1,4 @@
-"""Train VAE-GAN for Text-to-Image Generation on A100 GPU."""
+"""Train VAE-GAN for Text-to-Image Generation (v2 — CLIP)."""
 import os
 import sys
 import time
@@ -11,16 +11,17 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import (DATA_DIR, GLOVE_PATH, IMAGE_SIZE, LATENT_DIM, TEXT_EMBED_DIM,
+from config import (DATA_DIR, IMAGE_SIZE, LATENT_DIM, TEXT_EMBED_DIM,
                     CONDITION_DIM, BASE_CHANNELS, BATCH_SIZE, EPOCHS,
                     LR_G, LR_D, BETA1, BETA2, KL_WEIGHT, ADV_WEIGHT,
-                    PERCEPTUAL_WEIGHT, RECON_WEIGHT, GP_WEIGHT, GRAD_CLIP,
-                    KL_ANNEAL_EPOCHS, USE_AMP, LOG_INTERVAL,
+                    PERCEPTUAL_WEIGHT, RECON_WEIGHT, GP_WEIGHT, MATCH_WEIGHT,
+                    GRAD_CLIP, KL_ANNEAL_EPOCHS, USE_AMP, LOG_INTERVAL,
                     SAVE_INTERVAL, SAMPLE_INTERVAL, N_SAMPLES,
-                    DEVICE, OUTPUT_DIR, CHECKPOINT_DIR)
+                    DEVICE, OUTPUT_DIR, CHECKPOINT_DIR, CLIP_CACHE)
 from dataset import FlowersDataset
 from model import (VaeGan, Discriminator, PerceptualLoss,
-                   vae_loss, d_loss_fn, g_loss_fn, gradient_penalty)
+                   vae_loss, d_loss_fn, g_loss_fn, gradient_penalty,
+                   matching_loss)
 
 
 def save_sample_images(vae_gan, dataset, epoch, device, n=N_SAMPLES):
@@ -70,22 +71,23 @@ def save_generated(vae_gan, dataset, epoch, device, n=4):
 
 def train(args):
     print("=" * 60)
-    print("VAE-GAN Text-to-Image Training")
+    print("VAE-GAN Text-to-Image Training (v2 — CLIP)")
     print("=" * 60)
     print(f"Device: {DEVICE}")
     print(f"Image size: {IMAGE_SIZE}×{IMAGE_SIZE}")
     print(f"Epochs: {EPOCHS}, Batch size: {BATCH_SIZE}")
+    print(f"Text encoder: CLIP ViT-B/32 (512d)")
     print(f"AMP: {USE_AMP}")
     print()
 
     # --- Data ---
     train_dataset = FlowersDataset(
-        DATA_DIR, GLOVE_PATH, split="train",
-        image_size=IMAGE_SIZE, glove_dim=TEXT_EMBED_DIM, augment=True)
+        DATA_DIR, split="train",
+        image_size=IMAGE_SIZE, augment=True, clip_cache_path=CLIP_CACHE)
 
     val_dataset = FlowersDataset(
-        DATA_DIR, GLOVE_PATH, split="val",
-        image_size=IMAGE_SIZE, glove_dim=TEXT_EMBED_DIM, augment=False)
+        DATA_DIR, split="val",
+        image_size=IMAGE_SIZE, augment=False, clip_cache_path=CLIP_CACHE)
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=4, pin_memory=True, drop_last=True)
@@ -113,9 +115,39 @@ def train(args):
     opt_g = torch.optim.Adam(vae_gan.parameters(), lr=LR_G, betas=(BETA1, BETA2))
     opt_d = torch.optim.Adam(discriminator.parameters(), lr=LR_D, betas=(BETA1, BETA2))
 
+    # --- Resume from checkpoint ---
+    start_epoch = 1
+    resume_path = args.resume
+    if resume_path is None:
+        default_ckpt = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+        if os.path.exists(default_ckpt):
+            resume_path = default_ckpt
+
+    if resume_path and os.path.exists(resume_path):
+        print(f"Resuming from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=True)
+        try:
+            vae_gan.load_state_dict(ckpt['vae_gan_state_dict'])
+            discriminator.load_state_dict(ckpt['discriminator_state_dict'])
+            print(f"  Model weights restored")
+        except Exception as e:
+            print(f"  [WARN] Could not restore model weights (architecture changed?): {e}")
+            print(f"  Training from scratch")
+        try:
+            opt_g.load_state_dict(ckpt['opt_g'])
+            opt_d.load_state_dict(ckpt['opt_d'])
+            print(f"  Optimizer states restored")
+        except Exception:
+            print(f"  Fresh optimizers (LR reset)")
+        start_epoch = ckpt.get('epoch', 0) + 1
+        print(f"  Resuming from epoch {start_epoch}")
+    else:
+        print("Training from scratch")
+
     # --- Schedulers ---
-    sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=EPOCHS)
-    sched_d = torch.optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=EPOCHS)
+    remaining_epochs = EPOCHS - start_epoch + 1
+    sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=max(remaining_epochs, 1))
+    sched_d = torch.optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=max(remaining_epochs, 1))
 
     # --- AMP ---
     scaler_g = torch.amp.GradScaler('cuda') if USE_AMP and DEVICE == "cuda" else None
@@ -128,11 +160,11 @@ def train(args):
     best_val_loss = float('inf')
     total_steps = 0
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch, EPOCHS + 1):
         epoch_start = time.time()
 
-        # Step schedulers at start of epoch (after previous epoch's optimizer steps)
-        if epoch > 1:
+        # Step schedulers at start of epoch
+        if epoch > start_epoch:
             sched_g.step()
             sched_d.step()
 
@@ -142,13 +174,12 @@ def train(args):
         vae_gan.train()
         discriminator.train()
 
-        d_loss_sum = g_loss_sum = recon_sum = kl_sum = percep_sum = adv_sum = 0.0
+        d_loss_sum = g_loss_sum = recon_sum = kl_sum = percep_sum = adv_sum = match_sum = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{EPOCHS}", unit="batch")
         for batch_idx, (images, text_embeds, _) in enumerate(pbar):
             images = images.to(DEVICE, non_blocking=True)
             text_embeds = text_embeds.to(DEVICE, non_blocking=True)
-            batch_size_actual = images.size(0)
             total_steps += 1
 
             # ═══════════════════════════════════
@@ -157,13 +188,11 @@ def train(args):
             with torch.no_grad():
                 recon, _, _, condition = vae_gan(images, text_embeds)
 
-            # Only train D every other step sometimes (optional balancing)
             n_critic = 1
             for _ in range(n_critic):
                 opt_d.zero_grad(set_to_none=True)
 
                 if scaler_d is not None:
-                    # GP uses autograd.grad (2nd-order) — keep in FP32
                     with torch.amp.autocast('cuda'):
                         real_logit = discriminator(images, condition)
                         fake_logit = discriminator(recon.detach(), condition)
@@ -172,7 +201,7 @@ def train(args):
                                           recon.detach().float(), condition.float())
                     d_total = d_loss + GP_WEIGHT * gp
                     scaler_d.scale(d_total).backward()
-                    scaler_d.unscale_(optimizer=opt_d)
+                    scaler_d.unscale_(opt_d)
                     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP)
                     scaler_d.step(opt_d)
                     scaler_d.update()
@@ -197,10 +226,12 @@ def train(args):
                     p_loss = perceptual(recon, images)
                     fake_logit_g = discriminator(recon, condition)
                     adv_loss = g_loss_fn(fake_logit_g)
+                    m_loss = matching_loss(condition, mu)
                     g_total = (RECON_WEIGHT * l1_loss + kl_loss +
-                               PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss)
+                               PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss +
+                               MATCH_WEIGHT * m_loss)
                 scaler_g.scale(g_total).backward()
-                scaler_g.unscale_(optimizer=opt_g)
+                scaler_g.unscale_(opt_g)
                 torch.nn.utils.clip_grad_norm_(vae_gan.parameters(), GRAD_CLIP)
                 scaler_g.step(opt_g)
                 scaler_g.update()
@@ -210,15 +241,17 @@ def train(args):
                 p_loss = perceptual(recon, images)
                 fake_logit_g = discriminator(recon, condition)
                 adv_loss = g_loss_fn(fake_logit_g)
+                m_loss = matching_loss(condition, mu)
                 g_total = (RECON_WEIGHT * l1_loss + kl_loss +
-                           PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss)
+                           PERCEPTUAL_WEIGHT * p_loss + ADV_WEIGHT * adv_loss +
+                           MATCH_WEIGHT * m_loss)
                 g_total.backward()
                 torch.nn.utils.clip_grad_norm_(vae_gan.parameters(), GRAD_CLIP)
                 opt_g.step()
 
-            # NaN detection: skip tracking if exploded
+            # NaN detection
             if torch.isnan(g_total) or torch.isinf(g_total):
-                print(f"\n  [WARN] NaN/Inf detected at batch {batch_idx+1}, epoch {epoch}")
+                print(f"\n  [WARN] NaN/Inf at batch {batch_idx+1}, epoch {epoch}")
                 continue
 
             # Track losses
@@ -228,16 +261,15 @@ def train(args):
             kl_sum += kl_loss.item()
             percep_sum += p_loss.item()
             adv_sum += adv_loss.item()
+            match_sum += m_loss.item()
 
             if (batch_idx + 1) % LOG_INTERVAL == 0:
                 pbar.set_postfix({
                     'D': f'{d_loss.item():.3f}',
                     'G': f'{g_total.item():.3f}',
                     'L1': f'{l1_loss.item():.3f}',
-                    'KL': f'{kl_loss.item():.4f}',
-                    'P': f'{p_loss.item():.3f}',
                     'Adv': f'{adv_loss.item():.3f}',
-                    'kl_w': f'{kl_w:.1e}',
+                    'M': f'{m_loss.item():.3f}',
                 })
 
         # --- End of epoch ---
@@ -248,8 +280,8 @@ def train(args):
 
         print(f"Epoch {epoch:3d}/{EPOCHS} | "
               f"D={d_loss_sum/n_batches:.3f} G={g_loss_sum/n_batches:.3f} "
-              f"L1={recon_sum/n_batches:.4f} KL={kl_sum/n_batches:.5f} "
-              f"P={percep_sum/n_batches:.3f} Adv={adv_sum/n_batches:.3f} "
+              f"L1={recon_sum/n_batches:.4f} Adv={adv_sum/n_batches:.3f} "
+              f"Match={match_sum/n_batches:.3f} "
               f"lr_g={lr_g:.1e} lr_d={lr_d:.1e} | {elapsed:.0f}s")
 
         # --- Validation ---
@@ -269,8 +301,7 @@ def train(args):
                or torch.isinf(torch.tensor(val_loss))) else ""))
 
         if torch.isnan(torch.tensor(val_loss)) or torch.isinf(torch.tensor(val_loss)):
-            print("  [WARN] Validation NaN — loading best checkpoint and reducing LR by 10x")
-            # Try to recover: reload best model, reduce learning rates
+            print("  [WARN] Validation NaN — loading best checkpoint and reducing LR")
             best_path = os.path.join(CHECKPOINT_DIR, "best_model.pt")
             if os.path.exists(best_path):
                 ckpt = torch.load(best_path, map_location=DEVICE, weights_only=True)
@@ -322,6 +353,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr_g", type=float, default=None)
     parser.add_argument("--lr_d", type=float, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint (default: auto-detect best_model.pt)")
     args = parser.parse_args()
 
     import config

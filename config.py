@@ -1,4 +1,4 @@
-"""Text-to-Image VAE-GAN Configuration"""
+"""Text-to-Image VAE-GAN Configuration (v2 — CLIP)"""
 import os
 import torch
 
@@ -6,23 +6,22 @@ import torch
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 DATA_DIR = os.path.join(BASE_DIR, "data")
-GLOVE_DIR = os.path.join(BASE_DIR, "data", "glove")
-GLOVE_PATH = os.path.join(GLOVE_DIR, "glove.6B.50d.txt")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
+CLIP_CACHE = os.path.join(DATA_DIR, "clip_embeddings.pt")
 
 # --- Image ---
 IMAGE_SIZE = 128
 
 # --- Model ---
 LATENT_DIM = 256
-TEXT_EMBED_DIM = 50          # GloVe 50d
-CONDITION_DIM = 256
+TEXT_EMBED_DIM = 512         # CLIP ViT-B/32 output dim (replaces GloVe 50d)
+CONDITION_DIM = 512          # must match TEXT_EMBED_DIM
 BASE_CHANNELS = 64           # multiplier for conv channels
 
 # --- Training ---
 BATCH_SIZE = 64
-EPOCHS = 200
+EPOCHS = 300
 
 # Optimizer
 LR_G = 1e-4                  # Generator (VAE) learning rate
@@ -32,10 +31,11 @@ BETA2 = 0.999
 
 # Loss weights
 KL_WEIGHT = 0.0001           # KL divergence
-ADV_WEIGHT = 0.5             # Adversarial loss for G
+ADV_WEIGHT = 1.0             # 0.5→1.0 stronger adversarial to fight blur
 PERCEPTUAL_WEIGHT = 0.1      # Perceptual (VGG) loss
 RECON_WEIGHT = 1.0           # L1 reconstruction
-GP_WEIGHT = 2.0              # Gradient penalty (reduced for stability)
+GP_WEIGHT = 1.5              # 2.0→1.5 less penalty, let D learn harder
+MATCH_WEIGHT = 0.5           # text-image matching loss (new)
 
 # Gradient clipping
 GRAD_CLIP = 1.0              # max gradient norm (prevents explosion)
