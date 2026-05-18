@@ -1,15 +1,14 @@
-"""Download Oxford-102 Flowers dataset + GloVe word vectors."""
+"""Download Oxford-102 Flowers dataset."""
 import os
 import sys
 import tarfile
 import urllib.request
-import zipfile
 import scipy.io as sio
 import json
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import DATA_DIR, GLOVE_DIR, GLOVE_PATH
+from config import DATA_DIR
 
 
 class DownloadProgressBar(tqdm):
@@ -189,27 +188,7 @@ def generate_captions(data_dir):
     print(f"Saved {json_path} ({len(captions_dict)} images, 102 species)")
 
 
-def download_glove(glove_dir):
-    """Download GloVe 6B 50d (~170 MB)."""
-    os.makedirs(glove_dir, exist_ok=True)
-    glove_txt = os.path.join(glove_dir, "glove.6B.50d.txt")
-
-    if os.path.exists(glove_txt):
-        print(f"GloVe already exists: {glove_txt}")
-        return
-
-    print("Downloading GloVe 6B (~100 MB zip)...")
-    zip_path = os.path.join(glove_dir, "glove.6B.zip")
-    download_url("https://nlp.stanford.edu/data/glove.6B.zip", zip_path)
-
-    print("Extracting GloVe...")
-    with zipfile.ZipFile(zip_path, 'r') as z:
-        z.extractall(glove_dir)
-    os.remove(zip_path)
-    print(f"GloVe extracted to {glove_dir}")
-
-
-def verify_data(data_dir, glove_path):
+def verify_data(data_dir):
     print("\n=== Data verification ===")
 
     images_dir = os.path.join(data_dir, "jpg")
@@ -229,14 +208,6 @@ def verify_data(data_dir, glove_path):
         print("Captions file missing!")
         return False
 
-    if os.path.exists(glove_path):
-        with open(glove_path, 'r', encoding='utf-8') as f:
-            n = sum(1 for _ in f)
-        print(f"GloVe: {n} words")
-    else:
-        print("GloVe file missing!")
-        return False
-
     print("All OK!")
     return True
 
@@ -248,5 +219,4 @@ if __name__ == "__main__":
 
     download_images(DATA_DIR)
     prepare_flowers(DATA_DIR)
-    download_glove(GLOVE_DIR)
-    verify_data(DATA_DIR, GLOVE_PATH)
+    verify_data(DATA_DIR)
